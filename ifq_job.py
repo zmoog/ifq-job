@@ -5,110 +5,21 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 import requests
 from ifq import DownloadError, IssueNotAvailableError, LoginError, Scraper
-from opentelemetry import metrics
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import Status, StatusCode
 
 FILENAME_PATTERN = "ilfatto-%Y%m%d.pdf"
 SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "ifq-job")
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def log_event(level: str, event: str, run_id: str, **fields: object) -> None:
-    payload = {
-        "timestamp": now_utc_iso(),
-        "level": level,
-        "service.name": SERVICE_NAME,
-        "event": event,
-        "run_id": run_id,
-    }
-    payload.update(fields)
-    print(json.dumps(payload, ensure_ascii=False), file=sys.stdout, flush=True)
-
-
-class Observability:
-    def __init__(self):
-        self.enabled = env_bool("OTEL_ENABLED", False)
-        self.provider = None
-        self.runs_total = None
-        self.duration = None
-        self.retries_total = None
-        self.errors_total = None
-        self.dropbox_exists_checks_total = None
-
-        if not self.enabled:
-            return
-
-        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-        exporter = OTLPMetricExporter(endpoint=endpoint) if endpoint else OTLPMetricExporter()
-        reader = PeriodicExportingMetricReader(exporter)
-
-        resource = Resource.create({"service.name": SERVICE_NAME})
-        self.provider = MeterProvider(metric_readers=[reader], resource=resource)
-        metrics.set_meter_provider(self.provider)
-
-        meter = metrics.get_meter(SERVICE_NAME)
-        self.runs_total = meter.create_counter("ifq_job_runs_total")
-        self.duration = meter.create_histogram("ifq_job_duration_seconds")
-        self.retries_total = meter.create_counter("ifq_job_retries_total")
-        self.errors_total = meter.create_counter("ifq_job_errors_total")
-        self.dropbox_exists_checks_total = meter.create_counter(
-            "ifq_dropbox_exists_checks_total"
-        )
-
-    def add_run(self, status: str, attrs: Dict[str, str]) -> None:
-        if self.runs_total:
-            self.runs_total.add(1, attributes={**attrs, "status": status})
-
-    def record_duration(self, duration_seconds: float, attrs: Dict[str, str]) -> None:
-        if self.duration:
-            self.duration.record(duration_seconds, attributes=attrs)
-
-    def add_retry(self, attrs: Dict[str, str]) -> None:
-        if self.retries_total:
-            self.retries_total.add(1, attributes=attrs)
-
-    def add_error(self, bucket: str, error_type: str, attrs: Dict[str, str]) -> None:
-        if self.errors_total:
-            self.errors_total.add(
-                1,
-                attributes={
-                    **attrs,
-                    "bucket": bucket,
-                    "error_type": error_type,
-                },
-            )
-
-    def add_dropbox_exists_check(self, result: str, attrs: Dict[str, str]) -> None:
-        if self.dropbox_exists_checks_total:
-            self.dropbox_exists_checks_total.add(
-                1,
-                attributes={**attrs, "result": result},
-            )
-
-    def shutdown(self) -> None:
-        if not self.provider:
-            return
-        self.provider.force_flush()
-        self.provider.shutdown()
 
 
 def env(name: str) -> str:
@@ -118,10 +29,11 @@ def env(name: str) -> str:
     return value
 
 
-def parse_day(raw: Optional[str]) -> date:
-    if not raw:
-        return date.today()
-    return datetime.strptime(raw, "%Y-%m-%d").date()
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def env_int(name: str, default: int) -> int:
@@ -132,6 +44,59 @@ def env_int(name: str, default: int) -> int:
     if value < 1:
         raise RuntimeError(f"{name} must be >= 1, got {value}")
     return value
+
+
+def parse_day(raw: Optional[str]) -> date:
+    if not raw:
+        return date.today()
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def parse_otlp_headers(raw: Optional[str]) -> Dict[str, str]:
+    if not raw:
+        return {}
+    headers = {}
+    for item in raw.split(","):
+        key, sep, value = item.partition("=")
+        if sep:
+            headers[key.strip()] = value.strip()
+    return headers
+
+
+def log(message: str) -> None:
+    print(f"[ifq-job] {message}", flush=True)
+
+
+class Tracing:
+    def __init__(self):
+        self.enabled = env_bool("OTEL_ENABLED", False)
+        self.provider = None
+
+        if self.enabled:
+            endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+            headers = parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS"))
+
+            exporter_kwargs = {}
+            if endpoint:
+                exporter_kwargs["endpoint"] = endpoint
+            if headers:
+                exporter_kwargs["headers"] = headers
+
+            exporter = OTLPSpanExporter(**exporter_kwargs)
+            span_processor = BatchSpanProcessor(exporter)
+            self.provider = TracerProvider(
+                resource=Resource.create({"service.name": SERVICE_NAME})
+            )
+            self.provider.add_span_processor(span_processor)
+            trace.set_tracer_provider(self.provider)
+
+        self.tracer = trace.get_tracer(SERVICE_NAME)
+
+    def shutdown(self) -> None:
+        if not self.provider:
+            return
+        self.provider.force_flush()
+        self.provider.shutdown()
 
 
 def run_ifq_download(username: str, password: str, day: date, output_dir: str) -> Path:
@@ -220,52 +185,52 @@ def is_transient_error(exc: Exception) -> bool:
 
 
 def run_once(
+    tracer,
+    run_id: str,
+    issue_date: str,
     ifq_username: str,
     ifq_password: str,
     dropbox_token: str,
     dropbox_root: str,
     requested_day: date,
-    run_id: str,
-    obs: Observability,
-    attrs: Dict[str, str],
 ) -> None:
     filename = requested_day.strftime(FILENAME_PATTERN)
 
-    log_event(
-        "INFO",
-        "dropbox_exists_check_start",
-        run_id,
-        filename=filename,
-        dropbox_root=dropbox_root,
-    )
-    if dropbox_issue_exists(dropbox_token, dropbox_root, filename):
-        obs.add_dropbox_exists_check("exists", attrs)
-        log_event("INFO", "dropbox_exists", run_id, filename=filename)
-        return
+    with tracer.start_as_current_span("dropbox.exists_check") as span:
+        span.set_attribute("run_id", run_id)
+        span.set_attribute("issue_date", issue_date)
+        span.set_attribute("filename", filename)
+        span.set_attribute("dropbox.root", dropbox_root)
 
-    obs.add_dropbox_exists_check("missing", attrs)
-    log_event("INFO", "ifq_download_start", run_id, issue_date=requested_day.isoformat())
+        exists = dropbox_issue_exists(dropbox_token, dropbox_root, filename)
+        span.set_attribute("dropbox.exists", exists)
+        if exists:
+            log(f"{filename} already exists, nothing to do")
+            return
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        local_pdf = run_ifq_download(
-            ifq_username,
-            ifq_password,
-            requested_day,
-            tmpdir,
-        )
+        with tracer.start_as_current_span("ifq.download") as span:
+            span.set_attribute("run_id", run_id)
+            span.set_attribute("issue_date", issue_date)
+            local_pdf = run_ifq_download(
+                ifq_username,
+                ifq_password,
+                requested_day,
+                tmpdir,
+            )
 
-        log_event("INFO", "dropbox_upload_start", run_id, filename=filename)
-        upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
+        with tracer.start_as_current_span("dropbox.upload") as span:
+            span.set_attribute("run_id", run_id)
+            span.set_attribute("issue_date", issue_date)
+            span.set_attribute("filename", filename)
+            upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
 
-    log_event("INFO", "run_once_done", run_id, filename=filename)
+    log(f"done: {filename}")
 
 
 def main() -> int:
+    tracing = Tracing()
     run_id = str(uuid.uuid4())
-    obs = Observability()
-    start = time.monotonic()
-    status = "failed"
-    attrs: Dict[str, str] = {}
 
     try:
         ifq_username = env("IFQ_USERNAME")
@@ -276,81 +241,75 @@ def main() -> int:
 
         attempts = env_int("IFQ_RETRY_ATTEMPTS", 3)
         delay_seconds = env_int("IFQ_RETRY_DELAY_SECONDS", 60)
+        issue_date = requested_day.isoformat()
 
-        attrs = {
-            "issue_date": requested_day.isoformat(),
-        }
+        log(f"start run_id={run_id} issue_date={issue_date} max_attempts={attempts}")
 
-        log_event(
-            "INFO",
-            "job_start",
-            run_id,
-            issue_date=requested_day.isoformat(),
-            max_attempts=attempts,
-        )
+        with tracing.tracer.start_as_current_span("ifq.run") as root_span:
+            root_span.set_attribute("run_id", run_id)
+            root_span.set_attribute("issue_date", issue_date)
+            root_span.set_attribute("max_attempts", attempts)
 
-        for attempt in range(1, attempts + 1):
-            try:
-                log_event("INFO", "attempt_start", run_id, attempt=attempt)
-                run_once(
-                    ifq_username,
-                    ifq_password,
-                    dropbox_token,
-                    dropbox_root,
-                    requested_day,
-                    run_id,
-                    obs,
-                    attrs,
-                )
-                status = "success"
-                log_event("INFO", "job_success", run_id, attempt=attempt)
-                return 0
-            except Exception as exc:
-                transient = is_transient_error(exc)
-                bucket = "transient" if transient else "persistent"
-                error_type = type(exc).__name__
-                obs.add_error(bucket, error_type, attrs)
+            for attempt in range(1, attempts + 1):
+                with tracing.tracer.start_as_current_span("ifq.attempt") as attempt_span:
+                    attempt_span.set_attribute("run_id", run_id)
+                    attempt_span.set_attribute("issue_date", issue_date)
+                    attempt_span.set_attribute("attempt", attempt)
 
-                log_event(
-                    "ERROR",
-                    "attempt_failed",
-                    run_id,
-                    attempt=attempt,
-                    max_attempts=attempts,
-                    bucket=bucket,
-                    error_type=error_type,
-                    error=str(exc),
-                )
+                    try:
+                        run_once(
+                            tracing.tracer,
+                            run_id,
+                            issue_date,
+                            ifq_username,
+                            ifq_password,
+                            dropbox_token,
+                            dropbox_root,
+                            requested_day,
+                        )
+                        root_span.set_attribute("attempt_count", attempt)
+                        root_span.set_attribute("final_status", "success")
+                        log(f"success run_id={run_id} attempt={attempt}")
+                        return 0
+                    except Exception as exc:
+                        transient = is_transient_error(exc)
+                        bucket = "transient" if transient else "persistent"
 
-                if (not transient) or attempt == attempts:
-                    return 1
+                        attempt_span.record_exception(exc)
+                        attempt_span.set_attribute("error.type", type(exc).__name__)
+                        attempt_span.set_attribute("error.bucket", bucket)
+                        attempt_span.set_status(Status(StatusCode.ERROR, str(exc)))
 
-                obs.add_retry(attrs)
-                log_event(
-                    "INFO",
-                    "retry_scheduled",
-                    run_id,
-                    next_attempt=attempt + 1,
-                    delay_seconds=delay_seconds,
-                )
-                time.sleep(delay_seconds)
+                        if (not transient) or attempt == attempts:
+                            root_span.record_exception(exc)
+                            root_span.set_attribute("attempt_count", attempt)
+                            root_span.set_attribute("final_status", "failed")
+                            root_span.set_attribute("error.type", type(exc).__name__)
+                            root_span.set_attribute("error.bucket", bucket)
+                            root_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                            log(
+                                f"failed run_id={run_id} attempt={attempt}/{attempts} bucket={bucket} error={type(exc).__name__}: {exc}"
+                            )
+                            return 1
 
-        return 1
+                        log(
+                            f"retrying run_id={run_id} attempt={attempt}/{attempts} in {delay_seconds}s bucket={bucket}"
+                        )
+                        with tracing.tracer.start_as_current_span("retry.sleep") as retry_span:
+                            retry_span.set_attribute("run_id", run_id)
+                            retry_span.set_attribute("issue_date", issue_date)
+                            retry_span.set_attribute("attempt", attempt)
+                            retry_span.set_attribute("delay_seconds", delay_seconds)
+                            retry_span.set_attribute("error.type", type(exc).__name__)
+                            retry_span.set_attribute("error.bucket", bucket)
+                            time.sleep(delay_seconds)
+
+            return 1
     except Exception as exc:
-        log_event(
-            "ERROR",
-            "job_failed_before_attempts",
-            run_id,
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
+        log(f"failed run_id={run_id} before attempts error={type(exc).__name__}: {exc}")
         return 1
     finally:
-        duration = time.monotonic() - start
-        obs.add_run(status, attrs)
-        obs.record_duration(duration, attrs)
-        log_event("INFO", "job_end", run_id, status=status, duration_seconds=duration)
-        obs.shutdown()
+        tracing.shutdown()
 
 
 if __name__ == "__main__":
