@@ -16,6 +16,10 @@ Minimal job that:
 - `IFQ_DAY` (format `YYYY-MM-DD`)
 - `IFQ_RETRY_ATTEMPTS` (default `3`)
 - `IFQ_RETRY_DELAY_SECONDS` (default `60`)
+- `OTEL_ENABLED` (`true`/`false`, default `false`)
+- `OTEL_SERVICE_NAME` (default `ifq-job`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (optional OTLP traces endpoint)
+- `OTEL_EXPORTER_OTLP_HEADERS` (optional `k=v,k2=v2` headers)
 
 ## Local run
 
@@ -34,4 +38,6 @@ docker build -t ghcr.io/zmoog/ifq-job:latest .
 
 ## Observability
 
-See [docs/observability-spec.md](docs/observability-spec.md).
+- Minimal plain logs are always printed to stdout.
+- Traces are emitted via OpenTelemetry when `OTEL_ENABLED=true`.
+- See [docs/observability-spec.md](docs/observability-spec.md).

@@ -1,2 +1,5 @@
 ifq==0.4
+opentelemetry-api==1.35.0
+opentelemetry-exporter-otlp-proto-http==1.35.0
+opentelemetry-sdk==1.35.0
 requests==2.32.3
