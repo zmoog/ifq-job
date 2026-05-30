@@ -31,3 +31,7 @@ python ifq_job.py
 ```bash
 docker build -t ghcr.io/zmoog/ifq-job:latest .
 ```
+
+## Observability
+
+See [docs/observability-spec.md](docs/observability-spec.md).
