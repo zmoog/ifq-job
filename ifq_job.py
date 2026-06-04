@@ -199,7 +199,7 @@ def run_once(
     with tracer.start_as_current_span("dropbox.exists_check") as span:
         span.set_attribute("run_id", run_id)
         span.set_attribute("issue_date", issue_date)
-        span.set_attribute("filename", filename)
+        span.set_attribute("file.name", filename)
         span.set_attribute("dropbox.root", dropbox_root)
 
         exists = dropbox_issue_exists(dropbox_token, dropbox_root, filename)
@@ -219,10 +219,12 @@ def run_once(
                 tmpdir,
             )
 
+        upload_size = local_pdf.stat().st_size
         with tracer.start_as_current_span("dropbox.upload") as span:
             span.set_attribute("run_id", run_id)
             span.set_attribute("issue_date", issue_date)
-            span.set_attribute("filename", filename)
+            span.set_attribute("file.name", filename)
+            span.set_attribute("file.size", upload_size)
             upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
 
     log(f"done: {filename}")

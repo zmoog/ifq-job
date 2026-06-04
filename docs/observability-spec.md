@@ -33,6 +33,8 @@ Spans:
 
 Span attributes:
 - `run_id`, `issue_date`, `attempt`, `retry_count`, `result`
+- `file.name` on file-related spans (PDF filename)
+- `file.size` on `ifq.dropbox.upload` (uploaded PDF size in bytes)
 
 ## Error classification
 Follow current app buckets:
