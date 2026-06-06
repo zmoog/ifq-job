@@ -31,10 +31,11 @@ class _FakeTracer:
 
 
 class IfqJobTests(unittest.TestCase):
-    def test_retention_deletes_only_files_older_than_keep_window(self):
+    def test_retention_keeps_only_latest_n_ifq_files(self):
         entries = [
             {".tag": "file", "path_display": "/inbox/ilfatto-20260603.pdf"},
             {".tag": "file", "path_display": "/inbox/ilfatto-20260604.pdf"},
+            {".tag": "file", "path_display": "/inbox/ilfatto-20260605.pdf"},
             {".tag": "file", "path_display": "/inbox/notes.txt"},
         ]
         with (
@@ -44,14 +45,13 @@ class IfqJobTests(unittest.TestCase):
             moved = ifq_job.maybe_delete_old_dropbox_issues(
                 token="token",
                 source_root="/inbox",
-                keep_days=3,
-                reference_day=ifq_job.date(2026, 6, 6),
+                keep_issues=2,
             )
 
         self.assertEqual(moved, 1)
         delete_mock.assert_called_once_with("token", "/inbox/ilfatto-20260603.pdf")
 
-    def test_cleanup_runs_even_when_daily_issue_already_exists(self):
+    def test_cleanup_is_skipped_when_daily_issue_already_exists(self):
         tracer = _FakeTracer()
         with (
             patch.object(ifq_job, "dropbox_issue_exists", return_value=True),
@@ -71,13 +71,13 @@ class IfqJobTests(unittest.TestCase):
                 ifq_password="pass",
                 dropbox_token="token",
                 dropbox_root="/inbox",
-                keep_days=7,
+                keep_issues=7,
                 requested_day=ifq_job.date(2026, 6, 6),
             )
 
         download_mock.assert_not_called()
         upload_mock.assert_not_called()
-        cleanup_mock.assert_called_once()
+        cleanup_mock.assert_not_called()
 
 
 if __name__ == "__main__":

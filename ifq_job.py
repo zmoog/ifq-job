@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -209,14 +209,12 @@ def delete_dropbox_file(token: str, path: str) -> None:
 def maybe_delete_old_dropbox_issues(
     token: str,
     source_root: str,
-    keep_days: int,
-    reference_day: date,
+    keep_issues: int,
 ) -> int:
-    if keep_days < 1:
+    if keep_issues < 1:
         return 0
 
-    cutoff = reference_day - timedelta(days=keep_days - 1)
-    moved = 0
+    issues = []
 
     for entry in list_dropbox_files(token, source_root):
         if entry.get(".tag") != "file":
@@ -229,11 +227,13 @@ def maybe_delete_old_dropbox_issues(
         if not matched:
             continue
         file_day = datetime.strptime(matched.group(1), "%Y%m%d").date()
-        if file_day >= cutoff:
-            continue
+        issues.append((file_day, path))
+
+    issues.sort(reverse=True)
+    to_delete = issues[keep_issues:]
+    for _, path in to_delete:
         delete_dropbox_file(token, path)
-        moved += 1
-    return moved
+    return len(to_delete)
 
 
 def is_transient_error(exc: Exception) -> bool:
@@ -273,7 +273,7 @@ def run_once(
     ifq_password: str,
     dropbox_token: str,
     dropbox_root: str,
-    keep_days: int,
+    keep_issues: int,
     requested_day: date,
 ) -> None:
     filename = requested_day.strftime(FILENAME_PATTERN)
@@ -288,6 +288,8 @@ def run_once(
         span.set_attribute("dropbox.exists", exists)
         if exists:
             log(f"{filename} already exists, skipping download/upload")
+            log(f"done: {filename}")
+            return
 
     if not exists:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -312,9 +314,9 @@ def run_once(
     with tracer.start_as_current_span("dropbox.retention_cleanup") as span:
         span.set_attribute("run_id", run_id)
         span.set_attribute("issue_date", issue_date)
-        span.set_attribute("dropbox.keep_days", keep_days)
+        span.set_attribute("dropbox.keep_issues", keep_issues)
         removed = maybe_delete_old_dropbox_issues(
-            dropbox_token, dropbox_root, keep_days, requested_day
+            dropbox_token, dropbox_root, keep_issues
         )
         span.set_attribute("dropbox.deleted_count", removed)
         if removed:
@@ -332,7 +334,7 @@ def main() -> int:
         ifq_password = env("IFQ_PASSWORD")
         dropbox_token = env("DROPBOX_ACCESS_TOKEN")
         dropbox_root = env("DROPBOX_ROOT_FOLDER")
-        keep_days = env_non_negative_int("DROPBOX_KEEP_DAYS", 0)
+        keep_issues = env_non_negative_int("DROPBOX_KEEP_DAYS", 0)
         requested_day = parse_day(os.environ.get("IFQ_DAY"))
 
         attempts = env_int("IFQ_RETRY_ATTEMPTS", 3)
@@ -361,7 +363,7 @@ def main() -> int:
                             ifq_password,
                             dropbox_token,
                             dropbox_root,
-                            keep_days,
+                            keep_issues,
                             requested_day,
                         )
                         root_span.set_attribute("attempt_count", attempt)
