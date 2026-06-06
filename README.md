@@ -16,6 +16,8 @@ Minimal job that:
 - `IFQ_DAY` (format `YYYY-MM-DD`)
 - `IFQ_RETRY_ATTEMPTS` (default `3`)
 - `IFQ_RETRY_DELAY_SECONDS` (default `60`)
+- `DROPBOX_KEEP_DAYS` (default `0`; when `> 0`, archive old issues and keep only the latest N days in `DROPBOX_ROOT_FOLDER`)
+- `DROPBOX_ARCHIVE_ROOT_FOLDER` (required when `DROPBOX_KEEP_DAYS > 0`)
 - `OTEL_ENABLED` (`true`/`false`, default `false`)
 - `OTEL_SERVICE_NAME` (default `ifq-job`)
 - `OTEL_EXPORTER_OTLP_ENDPOINT` (optional OTLP traces endpoint)

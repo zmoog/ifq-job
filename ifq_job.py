@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -19,6 +20,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Status, StatusCode
 
 FILENAME_PATTERN = "ilfatto-%Y%m%d.pdf"
+FILENAME_REGEX = r"^ilfatto-(\d{8})\.pdf$"
 SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "ifq-job")
 
 
@@ -43,6 +45,16 @@ def env_int(name: str, default: int) -> int:
     value = int(raw)
     if value < 1:
         raise RuntimeError(f"{name} must be >= 1, got {value}")
+    return value
+
+
+def env_non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = int(raw)
+    if value < 0:
+        raise RuntimeError(f"{name} must be >= 0, got {value}")
     return value
 
 
@@ -155,6 +167,80 @@ def upload_to_dropbox(
         response.raise_for_status()
 
 
+def list_dropbox_files(token: str, root: str):
+    entries = []
+    url = "https://api.dropboxapi.com/2/files/list_folder"
+    payload = {"path": root, "recursive": False}
+    while True:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        entries.extend(data.get("entries", []))
+        cursor = data.get("cursor")
+        if not data.get("has_more"):
+            return entries
+        url = "https://api.dropboxapi.com/2/files/list_folder/continue"
+        payload = {"cursor": cursor}
+
+
+def move_dropbox_file(token: str, from_path: str, to_path: str) -> None:
+    response = requests.post(
+        "https://api.dropboxapi.com/2/files/move_v2",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+        json={
+            "from_path": from_path,
+            "to_path": to_path,
+            "allow_ownership_transfer": False,
+            "autorename": False,
+            "allow_shared_folder": False,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def maybe_archive_old_dropbox_issues(
+    token: str,
+    source_root: str,
+    archive_root: str,
+    keep_days: int,
+    reference_day: date,
+) -> int:
+    if keep_days < 1:
+        return 0
+
+    cutoff = reference_day - timedelta(days=keep_days - 1)
+    moved = 0
+
+    for entry in list_dropbox_files(token, source_root):
+        if entry.get(".tag") != "file":
+            continue
+        path = entry.get("path_display")
+        if not path:
+            continue
+        filename = Path(path).name
+        matched = re.match(FILENAME_REGEX, filename)
+        if not matched:
+            continue
+        file_day = datetime.strptime(matched.group(1), "%Y%m%d").date()
+        if file_day >= cutoff:
+            continue
+        move_dropbox_file(token, path, f"{archive_root}/{filename}")
+        moved += 1
+    return moved
+
+
 def is_transient_error(exc: Exception) -> bool:
     if isinstance(exc, IssueNotAvailableError):
         return True
@@ -192,6 +278,8 @@ def run_once(
     ifq_password: str,
     dropbox_token: str,
     dropbox_root: str,
+    archive_root: str,
+    keep_days: int,
     requested_day: date,
 ) -> None:
     filename = requested_day.strftime(FILENAME_PATTERN)
@@ -205,27 +293,38 @@ def run_once(
         exists = dropbox_issue_exists(dropbox_token, dropbox_root, filename)
         span.set_attribute("dropbox.exists", exists)
         if exists:
-            log(f"{filename} already exists, nothing to do")
-            return
+            log(f"{filename} already exists, skipping download/upload")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with tracer.start_as_current_span("ifq.download") as span:
-            span.set_attribute("run_id", run_id)
-            span.set_attribute("issue_date", issue_date)
-            local_pdf = run_ifq_download(
-                ifq_username,
-                ifq_password,
-                requested_day,
-                tmpdir,
-            )
+    if not exists:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with tracer.start_as_current_span("ifq.download") as span:
+                span.set_attribute("run_id", run_id)
+                span.set_attribute("issue_date", issue_date)
+                local_pdf = run_ifq_download(
+                    ifq_username,
+                    ifq_password,
+                    requested_day,
+                    tmpdir,
+                )
 
-        upload_size = local_pdf.stat().st_size
-        with tracer.start_as_current_span("dropbox.upload") as span:
-            span.set_attribute("run_id", run_id)
-            span.set_attribute("issue_date", issue_date)
-            span.set_attribute("file.name", filename)
-            span.set_attribute("file.size", upload_size)
-            upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
+            upload_size = local_pdf.stat().st_size
+            with tracer.start_as_current_span("dropbox.upload") as span:
+                span.set_attribute("run_id", run_id)
+                span.set_attribute("issue_date", issue_date)
+                span.set_attribute("file.name", filename)
+                span.set_attribute("file.size", upload_size)
+                upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
+
+    with tracer.start_as_current_span("dropbox.archive_cleanup") as span:
+        span.set_attribute("run_id", run_id)
+        span.set_attribute("issue_date", issue_date)
+        span.set_attribute("dropbox.keep_days", keep_days)
+        moved = maybe_archive_old_dropbox_issues(
+            dropbox_token, dropbox_root, archive_root, keep_days, requested_day
+        )
+        span.set_attribute("dropbox.archived_count", moved)
+        if moved:
+            log(f"archived {moved} old issue(s) to {archive_root}")
 
     log(f"done: {filename}")
 
@@ -239,6 +338,10 @@ def main() -> int:
         ifq_password = env("IFQ_PASSWORD")
         dropbox_token = env("DROPBOX_ACCESS_TOKEN")
         dropbox_root = env("DROPBOX_ROOT_FOLDER")
+        archive_root = os.environ.get("DROPBOX_ARCHIVE_ROOT_FOLDER", "").strip()
+        keep_days = env_non_negative_int("DROPBOX_KEEP_DAYS", 0)
+        if keep_days > 0 and not archive_root:
+            raise RuntimeError("DROPBOX_ARCHIVE_ROOT_FOLDER is required when DROPBOX_KEEP_DAYS > 0")
         requested_day = parse_day(os.environ.get("IFQ_DAY"))
 
         attempts = env_int("IFQ_RETRY_ATTEMPTS", 3)
@@ -267,6 +370,8 @@ def main() -> int:
                             ifq_password,
                             dropbox_token,
                             dropbox_root,
+                            archive_root,
+                            keep_days,
                             requested_day,
                         )
                         root_span.set_attribute("attempt_count", attempt)
