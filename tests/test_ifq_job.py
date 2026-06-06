@@ -31,7 +31,7 @@ class _FakeTracer:
 
 
 class IfqJobTests(unittest.TestCase):
-    def test_archive_moves_only_files_older_than_keep_window(self):
+    def test_retention_deletes_only_files_older_than_keep_window(self):
         entries = [
             {".tag": "file", "path_display": "/inbox/ilfatto-20260603.pdf"},
             {".tag": "file", "path_display": "/inbox/ilfatto-20260604.pdf"},
@@ -39,20 +39,17 @@ class IfqJobTests(unittest.TestCase):
         ]
         with (
             patch.object(ifq_job, "list_dropbox_files", return_value=entries),
-            patch.object(ifq_job, "move_dropbox_file") as move_mock,
+            patch.object(ifq_job, "delete_dropbox_file") as delete_mock,
         ):
-            moved = ifq_job.maybe_archive_old_dropbox_issues(
+            moved = ifq_job.maybe_delete_old_dropbox_issues(
                 token="token",
                 source_root="/inbox",
-                archive_root="/archive",
                 keep_days=3,
                 reference_day=ifq_job.date(2026, 6, 6),
             )
 
         self.assertEqual(moved, 1)
-        move_mock.assert_called_once_with(
-            "token", "/inbox/ilfatto-20260603.pdf", "/archive/ilfatto-20260603.pdf"
-        )
+        delete_mock.assert_called_once_with("token", "/inbox/ilfatto-20260603.pdf")
 
     def test_cleanup_runs_even_when_daily_issue_already_exists(self):
         tracer = _FakeTracer()
@@ -62,7 +59,7 @@ class IfqJobTests(unittest.TestCase):
             patch.object(ifq_job, "upload_to_dropbox") as upload_mock,
             patch.object(
                 ifq_job,
-                "maybe_archive_old_dropbox_issues",
+                "maybe_delete_old_dropbox_issues",
                 return_value=2,
             ) as cleanup_mock,
         ):
@@ -74,7 +71,6 @@ class IfqJobTests(unittest.TestCase):
                 ifq_password="pass",
                 dropbox_token="token",
                 dropbox_root="/inbox",
-                archive_root="/archive",
                 keep_days=7,
                 requested_day=ifq_job.date(2026, 6, 6),
             )

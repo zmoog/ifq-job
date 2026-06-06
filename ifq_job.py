@@ -191,29 +191,24 @@ def list_dropbox_files(token: str, root: str):
         payload = {"cursor": cursor}
 
 
-def move_dropbox_file(token: str, from_path: str, to_path: str) -> None:
+def delete_dropbox_file(token: str, path: str) -> None:
     response = requests.post(
-        "https://api.dropboxapi.com/2/files/move_v2",
+        "https://api.dropboxapi.com/2/files/delete_v2",
         headers={
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
         },
         json={
-            "from_path": from_path,
-            "to_path": to_path,
-            "allow_ownership_transfer": False,
-            "autorename": False,
-            "allow_shared_folder": False,
+            "path": path,
         },
         timeout=30,
     )
     response.raise_for_status()
 
 
-def maybe_archive_old_dropbox_issues(
+def maybe_delete_old_dropbox_issues(
     token: str,
     source_root: str,
-    archive_root: str,
     keep_days: int,
     reference_day: date,
 ) -> int:
@@ -236,7 +231,7 @@ def maybe_archive_old_dropbox_issues(
         file_day = datetime.strptime(matched.group(1), "%Y%m%d").date()
         if file_day >= cutoff:
             continue
-        move_dropbox_file(token, path, f"{archive_root}/{filename}")
+        delete_dropbox_file(token, path)
         moved += 1
     return moved
 
@@ -278,7 +273,6 @@ def run_once(
     ifq_password: str,
     dropbox_token: str,
     dropbox_root: str,
-    archive_root: str,
     keep_days: int,
     requested_day: date,
 ) -> None:
@@ -315,16 +309,16 @@ def run_once(
                 span.set_attribute("file.size", upload_size)
                 upload_to_dropbox(dropbox_token, dropbox_root, local_pdf, filename)
 
-    with tracer.start_as_current_span("dropbox.archive_cleanup") as span:
+    with tracer.start_as_current_span("dropbox.retention_cleanup") as span:
         span.set_attribute("run_id", run_id)
         span.set_attribute("issue_date", issue_date)
         span.set_attribute("dropbox.keep_days", keep_days)
-        moved = maybe_archive_old_dropbox_issues(
-            dropbox_token, dropbox_root, archive_root, keep_days, requested_day
+        removed = maybe_delete_old_dropbox_issues(
+            dropbox_token, dropbox_root, keep_days, requested_day
         )
-        span.set_attribute("dropbox.archived_count", moved)
-        if moved:
-            log(f"archived {moved} old issue(s) to {archive_root}")
+        span.set_attribute("dropbox.deleted_count", removed)
+        if removed:
+            log(f"deleted {removed} old issue(s) from {dropbox_root}")
 
     log(f"done: {filename}")
 
@@ -338,10 +332,7 @@ def main() -> int:
         ifq_password = env("IFQ_PASSWORD")
         dropbox_token = env("DROPBOX_ACCESS_TOKEN")
         dropbox_root = env("DROPBOX_ROOT_FOLDER")
-        archive_root = os.environ.get("DROPBOX_ARCHIVE_ROOT_FOLDER", "").strip()
         keep_days = env_non_negative_int("DROPBOX_KEEP_DAYS", 0)
-        if keep_days > 0 and not archive_root:
-            raise RuntimeError("DROPBOX_ARCHIVE_ROOT_FOLDER is required when DROPBOX_KEEP_DAYS > 0")
         requested_day = parse_day(os.environ.get("IFQ_DAY"))
 
         attempts = env_int("IFQ_RETRY_ATTEMPTS", 3)
@@ -370,7 +361,6 @@ def main() -> int:
                             ifq_password,
                             dropbox_token,
                             dropbox_root,
-                            archive_root,
                             keep_days,
                             requested_day,
                         )
